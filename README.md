@@ -1,4 +1,2 @@
-ipk-2013-project-2
+IPK 2013 Project 2
 ==================
-
-VUT FIT IPK 2013 Project 2
