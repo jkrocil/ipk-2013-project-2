@@ -92,11 +92,11 @@ int parse_url(char *raw_url, struct parsed_url *p_url) {
   strcpy(p_url->filename, str_buff);
 
   if (DEBUG) {
-    printf("Parsed URL:\n"\
-           "Host: '%s'\n"\
-           "Port: '%d'\n"\
-           "Filename: '%s'\n"\
-           "\n"\
+    printf("Parsed URL:\n"
+           "Host: '%s'\n"
+           "Port: '%d'\n"
+           "Filename: '%s'\n"
+           "\n"
            "Communication:\n",
            p_url->hostname, p_url->port, p_url->filename);
   }
@@ -139,7 +139,7 @@ int connect_to_server(char *hostname, int port, int sock) {
 }
 
 
-int exchange_info(char *filename, uint64_t *filesize, int sock) {
+int exchange_info(char *filename, int64_t *filesize, int sock) {
   char str_buff[STR_BUFF_SIZE] = "";
   sprintf(str_buff, "FILENAME: %s\n", filename);
   if (write(sock, str_buff, strlen(str_buff)) < 0)
@@ -168,12 +168,16 @@ int exchange_info(char *filename, uint64_t *filesize, int sock) {
 }
 
 
-int download_file(int in_sock, FILE *out_file, uint64_t filesize) {
+int download_file(int in_sock, FILE *out_file, int64_t filesize) {
   char data_buff[DATA_BUFF_SIZE] = "";
-  char bytes_read = 0;
-  while ((bytes_read = read(in_sock, data_buff, DATA_BUFF_SIZE)) != 0) {
-    fwrite(data_buff, 1, bytes_read, out_file);
+  int64_t bytes_read = 0, bytes_read_all, bytes_written;
+  while ((bytes_read = read(in_sock, data_buff, DATA_BUFF_SIZE)) > 0) {
+    bytes_read_all += bytes_read;
+    if ((bytes_written = fwrite(data_buff, 1, bytes_read, out_file)) <= 0)
+      break;
   }
+  if ((bytes_read < 0) || (bytes_written < 0) || (bytes_read_all != filesize))
+    return 1;
 
   return 0;
 }
@@ -184,7 +188,7 @@ int main(int argc, char *argv[]) {
   int status = 0;
   struct parsed_url p_url = {{0}};
   int sock;
-  uint64_t filesize;
+  int64_t filesize;
   FILE *out_file;
 
   // parse args
@@ -242,7 +246,7 @@ int main(int argc, char *argv[]) {
   // --------
 
 
-  // download data to file (timeout 10sec)
+  // download data to file
   status = download_file(sock, out_file, filesize);
   if (status != 0) {
     fprintf(stderr, "Error: Failed to download file.\n");
