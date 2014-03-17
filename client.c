@@ -7,11 +7,11 @@
  * ----------------------------------
  * Protocol (text,TCP):
  * client->server:
- *   FILENAME: filename.txt        \n
+ *   FILENAME: filename.txt              \n
  * server->client:
- *   STATUS: OK, NOT_FOUND, ERROR  \n
- *   FILESIZE: file size [bytes])  \n
- *   CONTENT:                      \n
+ *   STATUS: OK, NOT_FOUND, BUSY, ERROR  \n
+ *   FILESIZE: file size [bytes])        \n
+ *   CONTENT:                            \n
  *   data in binary
  * ----------------------------------
  */
@@ -31,15 +31,29 @@
 #define STR_BUFF_SIZE 4096
 #define DATA_BUFF_SIZE 32768
 
-int DEBUG = 0;
 
-
+// structures
 struct parsed_url {
   // host:port/filename
   char hostname[256]; // host
   int  port;          // port
   char filename[256]; // filename
 };
+// --------
+
+
+// prototypes
+int parse_url(char *raw_url, struct parsed_url *p_url);
+ssize_t read_line(int fildes, char *buf, ssize_t buff_size);
+int connect_to_server(char *hostname, int port, int sock);
+int exchange_info(char *filename, int64_t *filesize, int sock);
+int download_file(int in_sock, FILE *out_file, int64_t filesize);
+// --------
+
+
+// globals
+int DEBUG = 0;
+// --------
 
 
 int parse_url(char *raw_url, struct parsed_url *p_url) {
@@ -149,8 +163,10 @@ int exchange_info(char *filename, int64_t *filesize, int sock) {
 
   if (strcmp(str_buff, "STATUS: NOT_FOUND\n") == 0)
     return -1;
-  else if (strcmp(str_buff, "STATUS: ERROR\n") == 0)
+  else if (strcmp(str_buff, "STATUS: BUSY\n") == 0)
     return -2;
+  else if (strcmp(str_buff, "STATUS: ERROR\n") == 0)
+    return -3;
   else if (strcmp(str_buff, "STATUS: OK\n") != 0)
     return 1;
 
@@ -208,19 +224,10 @@ int main(int argc, char *argv[]) {
   // --------
 
 
-  // open file
-  out_file = fopen(p_url.filename, "w");
-  if (out_file == NULL) {
-    fprintf(stderr, "Error: Failed to create file '%s' in current working directory.\n", p_url.filename);
-    goto quit;
-  }
-  // --------
-
-
   // open socket
   if ((sock = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
     fprintf(stderr, "Error: Failed to open stream socket.\n");
-    goto close_file;
+    goto quit;
   }
   // --------
 
@@ -237,10 +244,21 @@ int main(int argc, char *argv[]) {
   if (status != 0) {
     if (status == -1)
       fprintf(stderr, "Error: File '%s' not found on server.\n", p_url.filename);
-    else if (status == -2)
+    else if (status == -3)
+      fprintf(stderr, "Error: Server is busy, try again later.\n");
+    else if (status == -3)
       fprintf(stderr, "Error: Failed to open file '%s' on server.\n", p_url.filename);
     else
       fprintf(stderr, "Error: Failed during initial data exchange with server.\n");
+    goto close_socket;
+  }
+  // --------
+
+
+  // open file
+  out_file = fopen(p_url.filename, "w");
+  if (out_file == NULL) {
+    fprintf(stderr, "Error: Failed to create file '%s' in current working directory.\n", p_url.filename);
     goto close_socket;
   }
   // --------
@@ -255,15 +273,14 @@ int main(int argc, char *argv[]) {
 
 
   // cleanup
-  close_socket:
-  if (close(sock) != 0) {
-    fprintf(stderr, "Error: Failed to close socket.\n");
+  if (fclose(out_file) != 0) {
+    fprintf(stderr, "Error: Failed to close file.\n");
     status = 1;
   }
 
-  close_file:
-  if (fclose(out_file) != 0) {
-    fprintf(stderr, "Error: Failed to close file.\n");
+  close_socket:
+  if (close(sock) != 0) {
+    fprintf(stderr, "Error: Failed to close socket.\n");
     status = 1;
   }
   // --------
