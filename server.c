@@ -56,7 +56,7 @@ struct parsed_args {
 
 
 // prototypes
-void kill_child_processes_and_exit();
+void term_child_processes_and_exit();
 void wait_for_child_processes();
 void reap_child_process();
 ssize_t read_line(int fildes, char *buf, ssize_t buff_size);
@@ -73,19 +73,20 @@ int parse_args(char *argv[], struct parsed_args *p_args);
 // globals
 struct shmem_segment *shmem;
 int welcome_sock;
+int data_sock;
 int DEBUG = 0;
 pid_t PID = 0;
 // --------
 
 
-void kill_child_processes_and_exit() {
-  kill(0, SIGKILL);
+void term_child_processes_and_exit() {
+  kill(0, SIGTERM);
   wait_for_child_processes();
   close(welcome_sock);
   sem_destroy(&shmem->mutex);
   munmap(&shmem, sizeof(struct shmem_segment));
   printf("Exiting...\n");
-  exit(2);
+  exit(EXIT_FAILURE);
 }
 
 
@@ -105,6 +106,12 @@ void reap_child_process() {
     shmem->concurrent_conns--;
     sem_post(&shmem->mutex);
   }
+}
+
+
+void child_exit() {
+  close(data_sock);
+  exit(EXIT_FAILURE);
 }
 
 
@@ -273,7 +280,6 @@ int attend_client(int sock, size_t limit) {
 
 void accept_connections(int sock, size_t limit) {
   int pid = 0;
-  int data_sock = 0;
 
   while (1) {
     data_sock = accept(sock, NULL, NULL);
@@ -283,13 +289,14 @@ void accept_connections(int sock, size_t limit) {
       pid = fork();
 
       if (pid == -1) { // error
-        kill_child_processes_and_exit();
-        exit(1);
+        close(data_sock);
+        term_child_processes_and_exit();
       }
 
       else if (pid == 0) { // child
-        close(sock);
         PID = getpid();
+        close(sock);
+        signal(SIGTERM, &child_exit);
         int ret = attend_client(data_sock, limit);
         if (DEBUG) {
           if (ret == 0)
@@ -427,8 +434,8 @@ int main(int argc, char *argv[]) {
   // register signal handlers
   if (DEBUG) printf("Registering signal handlers...\n");
   signal(SIGCHLD, &reap_child_process);
-  signal(SIGTERM, &kill_child_processes_and_exit);
-  signal(SIGINT, &kill_child_processes_and_exit);
+  signal(SIGTERM, &term_child_processes_and_exit);
+  signal(SIGINT, &term_child_processes_and_exit);
   // --------
 
 
