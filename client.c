@@ -242,7 +242,7 @@ int main(int argc, char *argv[]) {
     goto close_socket;
   }
 
-  // send file request; get status and filesize (timeout 10sec)
+  // send file request; get status and filesize
   if (DEBUG) printf("Exchanging initial information with server...\n");
   status = exchange_info(p_url.filename, &filesize, sock);
   if (status != 0) {
