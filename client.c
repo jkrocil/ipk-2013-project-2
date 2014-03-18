@@ -110,8 +110,7 @@ int parse_url(char *raw_url, struct parsed_url *p_url) {
            "Host: '%s'\n"
            "Port: '%d'\n"
            "Filename: '%s'\n"
-           "\n"
-           "Communication:\n",
+           "\n",
            p_url->hostname, p_url->port, p_url->filename);
   }
 
@@ -137,7 +136,7 @@ ssize_t read_line(int fildes, char *buf, ssize_t buff_size) {
 
 
 int connect_to_server(char *hostname, int port, int sock) {
-  struct sockaddr_in sock_in;
+  struct sockaddr_in sock_in = {0};
   struct hostent *host_e = NULL;
 
   sock_in.sin_family = PF_INET;
@@ -160,6 +159,7 @@ int exchange_info(char *filename, int64_t *filesize, int sock) {
     return 1;
   if (read_line(sock, str_buff, STR_BUFF_SIZE) < 0)
     return 1;
+  if (DEBUG) printf("%s", str_buff);
 
   if (strcmp(str_buff, "STATUS: NOT_FOUND\n") == 0)
     return -1;
@@ -172,6 +172,7 @@ int exchange_info(char *filename, int64_t *filesize, int sock) {
 
   if (read_line(sock, str_buff, STR_BUFF_SIZE) < 0)
     return 1;
+  if (DEBUG) printf("%s", str_buff);
   if (sscanf(str_buff, "FILESIZE: %" SCNd64 "\n", filesize) != 1)
     return 1;
 
@@ -186,7 +187,7 @@ int exchange_info(char *filename, int64_t *filesize, int sock) {
 
 int download_file(int in_sock, FILE *out_file, int64_t filesize) {
   char data_buff[DATA_BUFF_SIZE] = "";
-  int64_t bytes_read = 0, bytes_read_all, bytes_written;
+  int64_t bytes_read = 0, bytes_read_all = 0, bytes_written = 0;
   while ((bytes_read = read(in_sock, data_buff, DATA_BUFF_SIZE)) > 0) {
     bytes_read_all += bytes_read;
     if ((bytes_written = fwrite(data_buff, 1, bytes_read, out_file)) <= 0)
@@ -203,9 +204,9 @@ int download_file(int in_sock, FILE *out_file, int64_t filesize) {
 int main(int argc, char *argv[]) {
   int status = 0;
   struct parsed_url p_url = {{0}};
-  int sock;
-  int64_t filesize;
-  FILE *out_file;
+  int sock = 0;
+  int64_t filesize = 0;
+  FILE *out_file = NULL;
 
   // parse args
   if (argc == 3 && strcmp(argv[2], "--debug") == 0)
@@ -225,6 +226,7 @@ int main(int argc, char *argv[]) {
 
 
   // open socket
+  if (DEBUG) printf("Opening socket...\n");
   if ((sock = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
     fprintf(stderr, "Error: Failed to open stream socket.\n");
     goto quit;
@@ -233,6 +235,7 @@ int main(int argc, char *argv[]) {
 
 
   // connect to server
+  if (DEBUG) printf("Connecting to server...\n");
   status = connect_to_server(p_url.hostname, p_url.port, sock);
   if (status != 0) {
     fprintf(stderr, "Error: Failed to connect to server.\n");
@@ -240,11 +243,12 @@ int main(int argc, char *argv[]) {
   }
 
   // send file request; get status and filesize (timeout 10sec)
+  if (DEBUG) printf("Exchanging initial information with server...\n");
   status = exchange_info(p_url.filename, &filesize, sock);
   if (status != 0) {
     if (status == -1)
       fprintf(stderr, "Error: File '%s' not found on server.\n", p_url.filename);
-    else if (status == -3)
+    else if (status == -2)
       fprintf(stderr, "Error: Server is busy, try again later.\n");
     else if (status == -3)
       fprintf(stderr, "Error: Failed to open file '%s' on server.\n", p_url.filename);
@@ -256,6 +260,7 @@ int main(int argc, char *argv[]) {
 
 
   // open file
+  if (DEBUG) printf("Opening empty file...\n");
   out_file = fopen(p_url.filename, "w");
   if (out_file == NULL) {
     fprintf(stderr, "Error: Failed to create file '%s' in current working directory.\n", p_url.filename);
@@ -265,24 +270,20 @@ int main(int argc, char *argv[]) {
 
 
   // download data to file
+  printf("Downloading file...\n");
   status = download_file(sock, out_file, filesize);
   if (status != 0) {
     fprintf(stderr, "Error: Failed to download file.\n");
   }
+  else
+    printf("Download complete.\n");
   // --------
 
 
   // cleanup
-  if (fclose(out_file) != 0) {
-    fprintf(stderr, "Error: Failed to close file.\n");
-    status = 1;
-  }
-
+  fclose(out_file);
   close_socket:
-  if (close(sock) != 0) {
-    fprintf(stderr, "Error: Failed to close socket.\n");
-    status = 1;
-  }
+  close(sock);
   // --------
 
 
