@@ -29,7 +29,7 @@
 #include <unistd.h>
 
 #define STR_BUFF_SIZE 4096
-#define DATA_BUFF_SIZE 32768
+#define DATA_BUFF_SIZE 65536
 
 
 // structures
