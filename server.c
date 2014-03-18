@@ -19,8 +19,10 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <netdb.h>
 #include <semaphore.h>
+#include <signal.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,11 +30,14 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
+#define MIN(x, y) ( ( (x) < (y) ) ? (x) : (y) )
+
 #define STR_BUFF_SIZE 4096
-#define DATA_BUFF_SIZE 32768
-#define MAX_CONCURRENT_CONNS 8
+#define DATA_BUFF_SIZE 65536
+#define MAX_CONCURRENT_CONNS 32
 
 
 // structures
@@ -44,21 +49,23 @@ struct shmem_segment {
 
 struct parsed_args {
   // server -d limit [kB] -p port
-  unsigned long limit; // limit
-  int port;            // port
+  size_t limit; // limit
+  int port;     // port
 };
 // --------
 
 
 // prototypes
-void kill_child_processes();
+void kill_child_processes_and_exit();
 void wait_for_child_processes();
 void reap_child_process();
 ssize_t read_line(int fildes, char *buf, ssize_t buff_size);
 int64_t get_filesize(FILE *stream);
 int bind_socket(int port, int sock);
-int serve_file(int sock);
-void accept_connections(int sock);
+ssize_t send_segment(FILE *in_file, int out_sock, size_t max_bytes);
+int send_file(FILE *in_file, int out_sock, size_t limit);
+int attend_client(int sock, size_t limit);
+void accept_connections(int sock, size_t limit);
 int parse_args(char *argv[], struct parsed_args *p_args);
 // --------
 
@@ -67,37 +74,37 @@ int parse_args(char *argv[], struct parsed_args *p_args);
 struct shmem_segment *shmem;
 int welcome_sock;
 int DEBUG = 0;
+pid_t PID = 0;
 // --------
 
 
-void kill_child_processes()
-{
+void kill_child_processes_and_exit() {
   kill(0, SIGKILL);
   wait_for_child_processes();
   close(welcome_sock);
   sem_destroy(&shmem->mutex);
   munmap(&shmem, sizeof(struct shmem_segment));
+  printf("Exiting...\n");
+  exit(2);
 }
 
 
-void wait_for_child_processes()
-{
+void wait_for_child_processes() {
   while (1) {
-    if (wait(NULL) == -1) {
-      if (errno == ECHILD)
+    if ((wait(NULL) == -1) && (errno == ECHILD))
         break; // all child processes are over
-      else
-        kill_child_processes();
-    }
   }
 }
 
 
-void reap_child_process()
-{
+void reap_child_process() {
   int keep_waiting = 1;
-  while (keep_waiting)
+  while (keep_waiting) {
     keep_waiting = (waitpid(-1, NULL, WNOHANG) >= 0);
+    sem_wait(&shmem->mutex);
+    shmem->concurrent_conns--;
+    sem_post(&shmem->mutex);
+  }
 }
 
 
@@ -120,14 +127,16 @@ ssize_t read_line(int fildes, char *buf, ssize_t buff_size) {
 
 int64_t get_filesize(FILE *stream) {
   int64_t filesize = 0;
+  long original_pos = ftell(stream);
   fseek(stream, 0L, SEEK_END);
   filesize = ftell(stream);
+  fseek(stream, original_pos, SEEK_SET);
   return filesize;
 }
 
 
 int bind_socket(int port, int sock) {
-  struct sockaddr_in sock_in;
+  struct sockaddr_in sock_in = {0};
   struct hostent *host_e = NULL;
 
   sock_in.sin_family = PF_INET;
@@ -143,75 +152,167 @@ int bind_socket(int port, int sock) {
 }
 
 
-int send_file(FILE *in_file, int out_sock)  {
-  char data_buff[DATA_BUFF_SIZE] = "";
-  int64_t bytes_read = 0, bytes_read_all, bytes_written;
-  while ((bytes_read = fread(in_sock, data_buff, DATA_BUFF_SIZE)) > 0) {
-    bytes_read_all += bytes_read;
-    if ((bytes_written = fwrite(data_buff, 1, bytes_read, out_file)) <= 0)
-      break;
+int open_file_for_reading(char *filename, FILE **file) {
+  if (access(filename, R_OK) != 0) {
+    if (errno == ENOENT)
+      return 2;
+    return 1;
   }
-  if ((bytes_read < 0) || (bytes_written < 0) || (bytes_read_all != filesize))
+
+  *file = fopen(filename, "r");
+  if (*file == NULL)
     return 1;
 
   return 0;
 }
 
-int attend_client(int sock) {
+
+ssize_t send_segment(FILE *in_file, int out_sock, size_t max_bytes) {
+  char data_buff[DATA_BUFF_SIZE] = "";
+  size_t bytes_read = 0;
+  ssize_t bytes_sent = 0;
+
+  size_t bytes_to_read = MIN(DATA_BUFF_SIZE, max_bytes);
+  bytes_read = fread(data_buff, 1, bytes_to_read, in_file);
+  if ((bytes_read == 0) && (!feof(in_file)))
+    return -1;
+
+  bytes_sent = write(out_sock, data_buff, bytes_read);
+  if (bytes_sent < 0)
+    return -1;
+
+  return bytes_sent;
+}
+
+
+int send_file(FILE *in_file, int out_sock, size_t limit)  {
+  int64_t bytes_sent_total = 0;
+  ssize_t bytes_sent = 0, bytes_sent_sec = 0;
+  time_t current_sec = 0;
+
+  do {
+    if (current_sec == time(NULL))
+      usleep(2000);
+    else {
+      current_sec = time(NULL);
+      bytes_sent_sec = 0;
+      while ((limit - bytes_sent_sec) > 0) {
+        bytes_sent = send_segment(in_file, out_sock, limit - bytes_sent_sec);
+        if (bytes_sent == 0)
+          break;
+        bytes_sent_sec += bytes_sent;
+      }
+      if (DEBUG) printf("[%d] %ld bytes sent in time %ld\n", PID, bytes_sent_sec, current_sec);
+      bytes_sent_total += bytes_sent_sec;
+    }
+  } while (bytes_sent);
+
+  if (DEBUG) printf("[%d] %" PRId64 " bytes sent\n", PID, bytes_sent_total);
+  return bytes_sent_total;
+}
+
+
+int attend_client(int sock, size_t limit) {
   int status = 0;
   char str_buff[STR_BUFF_SIZE] = "";
+  char filename[256] = "";
+  FILE *file = NULL;
+  int64_t filesize = 0;
 
-  //
+  // load request
+  if (DEBUG) printf("[%d] Loading client file request...\n", PID);
   if (read_line(sock, str_buff, STR_BUFF_SIZE) < 0) {
     status = 1;
-    goto child_cleanup;
+    write(sock, "STATUS: ERROR\n", 14);
+    goto child_close_socket;
   }
-  if (sscanf() { // filename
+
+  // get filename
+  if (DEBUG) printf("[%d] Getting filename...\n", PID);
+  if (sscanf(str_buff, "FILENAME: %255s\n", filename) != 1) {
     status = 1;
-    goto child_cleanup;
+    write(sock, "STATUS: ERROR\n", 14);
+    goto child_close_socket;
   }
 
-  // open, NOTFOUND ?
+  // open file
+  if (DEBUG) printf("[%d] Opening requested file '%s'...\n", PID, filename);
+  status = open_file_for_reading(filename, &file);
+  if (status != 0) {
+    if (status == 2)
+      write(sock, "STATUS: NOT_FOUND\n", 18);
+    else
+      write(sock, "STATUS: ERROR\n", 14);
+    goto child_close_socket;
+  }
 
+  // get filesize
+  filesize = get_filesize(file);
 
-  // read and write
-  if (write(sock, str_buff, strlen(str_buff)) < 0)
-    return 1;
+  // send headers
+  if (DEBUG) printf("[%d] Sending headers...\n", PID);
+  write(sock, "STATUS: OK\n", 11);
+  sprintf(str_buff, "FILESIZE: %" PRId64 "\n", filesize);
+  write(sock, str_buff, strlen(str_buff));
+  write(sock, "CONTENT:\n", 9);
 
-  child_cleanup:
-  sem_wait(&shmem->mutex);
-  shmem->concurrent_conns--;
-  sem_post(&shmem->mutex);
+  // send file
+  if (DEBUG) printf("[%d] Sending file...\n", PID);
+  if (send_file(file, sock, limit) != filesize)
+    status = 1;
+
+  // cleanup
+  fclose(file);
+
+  child_close_socket:
+  close(sock);
 
   return status;
 }
 
 
-void accept_connections(int sock) {
+void accept_connections(int sock, size_t limit) {
   int pid = 0;
   int data_sock = 0;
 
   while (1) {
     data_sock = accept(sock, NULL, NULL);
+    if (DEBUG) printf("Accepted new connection...\n");
     sem_wait(&shmem->mutex);
     if (shmem->concurrent_conns < MAX_CONCURRENT_CONNS) {
       pid = fork();
+
       if (pid == -1) { // error
-        kill_child_processes();
+        kill_child_processes_and_exit();
         exit(1);
       }
+
       else if (pid == 0) { // child
         close(sock);
-        int ret = serve_file(data_sock);
+        PID = getpid();
+        int ret = attend_client(data_sock, limit);
+        if (DEBUG) {
+          if (ret == 0)
+            printf("[%d] File sent.\n", PID);
+          else if (ret == 1)
+            printf("[%d] Failed to send file.\n", PID);
+          else
+            printf("[%d] File not found.\n", PID);
+        }
         exit(ret);
       }
-      else {
+
+      else { // parent
         close(data_sock);
         shmem->concurrent_conns++;
       }
+
     }
-    else
-      write(sock, "STATUS: BUSY\n", 13);
+    else {
+      if (DEBUG) printf("Refused - too busy.\n");
+      write(data_sock, "STATUS: BUSY\n", 13);
+      close(data_sock);
+    }
     sem_post(&shmem->mutex);
   }
 
@@ -220,7 +321,7 @@ void accept_connections(int sock) {
 
 int parse_args(char *argv[], struct parsed_args *p_args) {
   int status = 0;
-  int limit_i = 0, port_i;
+  int limit_i = 0, port_i = 0;
 
   if ((strcmp("-d", argv[1]) == 0) && (strcmp("-p", argv[3]) == 0)) {
     limit_i = 2;
@@ -246,10 +347,12 @@ int parse_args(char *argv[], struct parsed_args *p_args) {
   if (DEBUG) {
     printf("Parsed args:\n"
            "Port: %d\n"
-           "Limit: %lu\n"
+           "Limit: %lu [kB]\n"
            "\n",
            p_args->port, p_args->limit);
   }
+
+  p_args->limit = 1000 * p_args->limit;
 
   return 0;
 }
@@ -261,9 +364,9 @@ int main(int argc, char *argv[]) {
   struct parsed_args p_args = {0,0};
 
   // parse args
-  if (argc == 5 && strcmp(argv[4], "--debug") == 0)
+  if (argc == 6 && strcmp(argv[5], "--debug") == 0)
     DEBUG = 1;
-  else if (argc != 4) {
+  else if (argc != 5) {
     status = 1;
     fprintf(stderr, "Error: Invalid argument.\n");
     printf("%s -p PORT -d LIMIT [--debug]\n"
@@ -281,6 +384,7 @@ int main(int argc, char *argv[]) {
 
 
   // open socket
+  if (DEBUG) printf("Opening socket...\n");
   if ((welcome_sock = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
     fprintf(stderr, "Error: Failed to open stream socket.\n");
     goto quit;
@@ -289,6 +393,7 @@ int main(int argc, char *argv[]) {
 
 
   // bind socket
+  if (DEBUG) printf("Binding socket...\n");
   if (bind_socket(p_args.port, welcome_sock) != 0) {
     fprintf(stderr, "Error: Failed to bind socket.\n");
     goto close_socket;
@@ -297,6 +402,7 @@ int main(int argc, char *argv[]) {
 
 
   // listen on socket
+  if (DEBUG) printf("Marking socket for listening...\n");
   if (listen(welcome_sock, 0) != 0) {
     fprintf(stderr, "Error: Failed to mark socket for listening.\n");
     goto close_socket;
@@ -304,8 +410,10 @@ int main(int argc, char *argv[]) {
   // --------
 
 
-  // map shared memory and mutex
-  shmem = mmap(NULL, sizeof(struct shmem_segment), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+  // map and init shared memory
+  if (DEBUG) printf("Mapping shared memory...\n");
+  shmem = mmap(NULL, sizeof(struct shmem_segment), PROT_READ|PROT_WRITE,
+               MAP_SHARED|MAP_ANONYMOUS, -1, 0);
   if (shmem == MAP_FAILED) {
     fprintf(stderr, "Error: Failed to map shared memory.\n");
     status = 1;
@@ -317,23 +425,22 @@ int main(int argc, char *argv[]) {
 
 
   // register signal handlers
+  if (DEBUG) printf("Registering signal handlers...\n");
   signal(SIGCHLD, &reap_child_process);
-  signal(SIGTERM, &kill_child_processes);
-  signal(SIGINT, &kill_child_processes);
+  signal(SIGTERM, &kill_child_processes_and_exit);
+  signal(SIGINT, &kill_child_processes_and_exit);
   // --------
 
 
   // accept connections
-  accept_connections(welcome_sock);
+  printf("Accepting connections on port %d\n", p_args.port);
+  accept_connections(welcome_sock, p_args.limit);
   // --------
 
 
   // cleanup
   close_socket:
-  if (close(welcome_sock) != 0) {
-    fprintf(stderr, "Error: Failed to close socket.\n");
-    status = 1;
-  }
+  close(welcome_sock);
   // --------
 
   quit:
