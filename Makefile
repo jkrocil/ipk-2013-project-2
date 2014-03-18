@@ -1,16 +1,11 @@
 CC = gcc
-CFLAGS = -Wall -std=gnu99 -g -pthread
-EXECS = client server
-
-define \n
-
-
-endef
+CFLAGS = -Wall -std=gnu99 -O3 -pthread
 
 ALL: build
 
 build: clean
-	$(foreach exec,$(EXECS), $(CC) $(CFLAGS) -o $(exec) $(exec).c$(\n))
+	$(CC) $(CFLAGS) -o client client.c
+	$(CC) $(CFLAGS) -o server server.c
 
 clean:
-	$(foreach exec,$(EXECS),rm -f $(exec)$(\n))
+	rm -f client server
