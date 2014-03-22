@@ -1,17 +1,19 @@
 /* IPK 2013/2014
  * Projekt c.2 - Prenos souboru s omezenim rychlosti
+ *               Bandwidth-limited file transmission
  * Autor: Jan Krocil
  *        xkroci02@stud.fit.vutbr.cz
  * Datum: 17.3.2014
  *
  * ----------------------------------
  * Protocol (text,TCP):
- * client->server:
- *   FILENAME: filename.txt              \n
- * server->client:
- *   STATUS: OK, NOT_FOUND, BUSY, ERROR  \n
- *   FILESIZE: file size [bytes])        \n
- *   CONTENT:                            \n
+ * client --> server:
+ *   FILENAME: filename.txt           \n
+ * client <-- server:
+ *   STATUS: OK|NOT_FOUND|BUSY|ERROR  \n
+ *   (if STATUS is OK)
+ *   FILESIZE: file size [bytes]      \n
+ *   CONTENT:                         \n
  *   data in binary
  * ----------------------------------
  */
@@ -42,8 +44,7 @@
 
 // structures
 struct shmem_segment {
-  sem_t mutex;
-  int concurrent_conns;
+  sem_t stdout_mutex;
 };
 
 
@@ -59,11 +60,13 @@ struct parsed_args {
 void term_child_processes_and_exit();
 void wait_for_child_processes();
 void reap_child_process();
+void child_exit();
 ssize_t read_line(int fildes, char *buf, ssize_t buff_size);
 int64_t get_filesize(FILE *stream);
 int bind_socket(int port, int sock);
-ssize_t send_segment(FILE *in_file, int out_sock, size_t max_bytes);
-int send_file(FILE *in_file, int out_sock, size_t limit);
+int open_file_for_reading(char *filename, FILE **file);
+size_t send_segment(FILE *in_file, int out_sock, size_t bytes);
+int64_t send_file(FILE *in_file, int out_sock, int64_t filesize, size_t limit);
 int attend_client(int sock, size_t limit);
 void accept_connections(int sock, size_t limit);
 int parse_args(char *argv[], struct parsed_args *p_args);
@@ -72,10 +75,11 @@ int parse_args(char *argv[], struct parsed_args *p_args);
 
 // globals
 struct shmem_segment *shmem;
+int concurrent_conns = 0;
 int welcome_sock;
 int data_sock;
 int DEBUG = 0;
-pid_t PID = 0;
+pid_t pid = 0;
 // --------
 
 
@@ -83,7 +87,7 @@ void term_child_processes_and_exit() {
   kill(0, SIGTERM);
   wait_for_child_processes();
   close(welcome_sock);
-  sem_destroy(&shmem->mutex);
+  sem_destroy(&shmem->stdout_mutex);
   munmap(&shmem, sizeof(struct shmem_segment));
   printf("Exiting...\n");
   exit(EXIT_FAILURE);
@@ -99,13 +103,7 @@ void wait_for_child_processes() {
 
 
 void reap_child_process() {
-  int keep_waiting = 1;
-  while (keep_waiting) {
-    keep_waiting = (waitpid(-1, NULL, WNOHANG) >= 0);
-    sem_wait(&shmem->mutex);
-    shmem->concurrent_conns--;
-    sem_post(&shmem->mutex);
-  }
+    waitpid(-1, NULL, WNOHANG);
 }
 
 
@@ -174,27 +172,30 @@ int open_file_for_reading(char *filename, FILE **file) {
 }
 
 
-ssize_t send_segment(FILE *in_file, int out_sock, size_t max_bytes) {
+size_t send_segment(FILE *in_file, int out_sock, size_t bytes) {
   char data_buff[DATA_BUFF_SIZE] = "";
-  size_t bytes_read = 0;
+  size_t bytes_read = 0, bytes_sent_total = 0;
   ssize_t bytes_sent = 0;
+  size_t bytes_to_send = MIN(bytes, DATA_BUFF_SIZE);
 
-  size_t bytes_to_read = MIN(DATA_BUFF_SIZE, max_bytes);
-  bytes_read = fread(data_buff, 1, bytes_to_read, in_file);
-  if ((bytes_read == 0) && (!feof(in_file)))
-    return -1;
+  while (bytes_to_send > 0) {
+    bytes_read = fread(data_buff, 1, bytes_to_send, in_file);
+    if ((bytes_read == 0) && (!feof(in_file)))
+      return -1;
+    bytes_sent = write(out_sock, data_buff, bytes_read);
+    if (bytes_sent < 0)
+      return -1;
+    bytes_sent_total += bytes_sent;
+    bytes_to_send = MIN((bytes - bytes_sent_total), DATA_BUFF_SIZE);
+  }
 
-  bytes_sent = write(out_sock, data_buff, bytes_read);
-  if (bytes_sent < 0)
-    return -1;
-
-  return bytes_sent;
+  return bytes_sent_total;
 }
 
 
-int send_file(FILE *in_file, int out_sock, size_t limit)  {
-  int64_t bytes_sent_total = 0;
-  ssize_t bytes_sent = 0, bytes_sent_sec = 0;
+int64_t send_file(FILE *in_file, int out_sock, int64_t filesize, size_t limit) {
+  int64_t bytes_to_send_sec = 0, bytes_sent_total = 0;
+  size_t bytes_sent_sec = 0;
   time_t current_sec = 0;
 
   do {
@@ -202,19 +203,24 @@ int send_file(FILE *in_file, int out_sock, size_t limit)  {
       usleep(2000);
     else {
       current_sec = time(NULL);
-      bytes_sent_sec = 0;
-      while ((limit - bytes_sent_sec) > 0) {
-        bytes_sent = send_segment(in_file, out_sock, limit - bytes_sent_sec);
-        if (bytes_sent == 0)
-          break;
-        bytes_sent_sec += bytes_sent;
+      bytes_to_send_sec = MIN((filesize - bytes_sent_total), limit);
+      bytes_sent_sec = send_segment(in_file, out_sock, bytes_to_send_sec);
+      if (bytes_sent_sec <= 0)
+        break;
+      if (DEBUG) {
+        sem_wait(&shmem->stdout_mutex);
+        printf("[%d] %ld bytes sent in time %ld\n", pid, bytes_sent_sec, current_sec);
+        sem_post(&shmem->stdout_mutex);
       }
-      if (DEBUG) printf("[%d] %ld bytes sent in time %ld\n", PID, bytes_sent_sec, current_sec);
       bytes_sent_total += bytes_sent_sec;
     }
-  } while (bytes_sent);
+  } while (1);
 
-  if (DEBUG) printf("[%d] %" PRId64 " bytes sent\n", PID, bytes_sent_total);
+  if (DEBUG) {
+    sem_wait(&shmem->stdout_mutex);
+    printf("[%d] %" PRId64 " bytes sent\n", pid, bytes_sent_total);
+    sem_post(&shmem->stdout_mutex);
+  }
   return bytes_sent_total;
 }
 
@@ -227,7 +233,11 @@ int attend_client(int sock, size_t limit) {
   int64_t filesize = 0;
 
   // load request
-  if (DEBUG) printf("[%d] Loading client file request...\n", PID);
+  if (DEBUG) {
+    sem_wait(&shmem->stdout_mutex);
+    printf("[%d] Loading client file request...\n", pid);
+    sem_post(&shmem->stdout_mutex);
+  }
   if (read_line(sock, str_buff, STR_BUFF_SIZE) < 0) {
     status = 1;
     write(sock, "STATUS: ERROR\n", 14);
@@ -235,7 +245,11 @@ int attend_client(int sock, size_t limit) {
   }
 
   // get filename
-  if (DEBUG) printf("[%d] Getting filename...\n", PID);
+  if (DEBUG) {
+    sem_wait(&shmem->stdout_mutex);
+    printf("[%d] Getting filename...\n", pid);
+    sem_post(&shmem->stdout_mutex);
+  }
   if (sscanf(str_buff, "FILENAME: %255s\n", filename) != 1) {
     status = 1;
     write(sock, "STATUS: ERROR\n", 14);
@@ -243,7 +257,11 @@ int attend_client(int sock, size_t limit) {
   }
 
   // open file
-  if (DEBUG) printf("[%d] Opening requested file '%s'...\n", PID, filename);
+  if (DEBUG) {
+    sem_wait(&shmem->stdout_mutex);
+    printf("[%d] Opening requested file '%s'...\n", pid, filename);
+    sem_post(&shmem->stdout_mutex);
+  }
   status = open_file_for_reading(filename, &file);
   if (status != 0) {
     if (status == 2)
@@ -257,15 +275,23 @@ int attend_client(int sock, size_t limit) {
   filesize = get_filesize(file);
 
   // send headers
-  if (DEBUG) printf("[%d] Sending headers...\n", PID);
+  if (DEBUG) {
+    sem_wait(&shmem->stdout_mutex);
+    printf("[%d] Sending headers...\n", pid);
+    sem_post(&shmem->stdout_mutex);
+  }
   write(sock, "STATUS: OK\n", 11);
   sprintf(str_buff, "FILESIZE: %" PRId64 "\n", filesize);
   write(sock, str_buff, strlen(str_buff));
   write(sock, "CONTENT:\n", 9);
 
   // send file
-  if (DEBUG) printf("[%d] Sending file...\n", PID);
-  if (send_file(file, sock, limit) != filesize)
+  if (DEBUG) {
+    sem_wait(&shmem->stdout_mutex);
+    printf("[%d] Sending file...\n", pid);
+    sem_post(&shmem->stdout_mutex);
+  }
+  if (send_file(file, sock, filesize, limit) != filesize)
     status = 1;
 
   // cleanup
@@ -279,48 +305,56 @@ int attend_client(int sock, size_t limit) {
 
 
 void accept_connections(int sock, size_t limit) {
-  int pid = 0;
+  int fork_ret = 0;
 
   while (1) {
     data_sock = accept(sock, NULL, NULL);
-    if (DEBUG) printf("Accepted new connection...\n");
-    sem_wait(&shmem->mutex);
-    if (shmem->concurrent_conns < MAX_CONCURRENT_CONNS) {
-      pid = fork();
+    if (DEBUG) {
+      sem_wait(&shmem->stdout_mutex);
+      printf("Accepted new connection...\n");
+      sem_post(&shmem->stdout_mutex);
+    }
+    if (concurrent_conns < MAX_CONCURRENT_CONNS) {
+      fork_ret = fork();
 
-      if (pid == -1) { // error
+      if (fork_ret == -1) { // error
         close(data_sock);
         term_child_processes_and_exit();
       }
 
-      else if (pid == 0) { // child
-        PID = getpid();
+      else if (fork_ret == 0) { // child
+        pid = getpid();
         close(sock);
         signal(SIGTERM, &child_exit);
         int ret = attend_client(data_sock, limit);
         if (DEBUG) {
+          sem_wait(&shmem->stdout_mutex);
           if (ret == 0)
-            printf("[%d] File sent.\n", PID);
+            printf("[%d] File sent.\n", pid);
           else if (ret == 1)
-            printf("[%d] Failed to send file.\n", PID);
+            printf("[%d] Failed to send file.\n", pid);
           else
-            printf("[%d] File not found.\n", PID);
+            printf("[%d] File not found.\n", pid);
+          sem_post(&shmem->stdout_mutex);
         }
         exit(ret);
       }
 
       else { // parent
         close(data_sock);
-        shmem->concurrent_conns++;
+        concurrent_conns++;
       }
 
     }
     else {
-      if (DEBUG) printf("Refused - too busy.\n");
+      if (DEBUG) {
+        sem_wait(&shmem->stdout_mutex);
+        printf("Refused - too busy.\n");
+        sem_post(&shmem->stdout_mutex);
+      }
       write(data_sock, "STATUS: BUSY\n", 13);
       close(data_sock);
     }
-    sem_post(&shmem->mutex);
   }
 
 }
@@ -390,25 +424,19 @@ int main(int argc, char *argv[]) {
   // --------
 
 
-  // open socket
+  // open, bind and mark welcoming socket for listening
   if (DEBUG) printf("Opening socket...\n");
   if ((welcome_sock = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
     fprintf(stderr, "Error: Failed to open stream socket.\n");
     goto quit;
   }
-  // --------
 
-
-  // bind socket
   if (DEBUG) printf("Binding socket...\n");
   if (bind_socket(p_args.port, welcome_sock) != 0) {
     fprintf(stderr, "Error: Failed to bind socket.\n");
     goto close_socket;
   }
-  // --------
 
-
-  // listen on socket
   if (DEBUG) printf("Marking socket for listening...\n");
   if (listen(welcome_sock, 0) != 0) {
     fprintf(stderr, "Error: Failed to mark socket for listening.\n");
@@ -426,8 +454,7 @@ int main(int argc, char *argv[]) {
     status = 1;
     goto close_socket;
   }
-  shmem->concurrent_conns = 0;
-  sem_init(&shmem->mutex, 1, 1);
+  sem_init(&shmem->stdout_mutex, 1, 1);
   // --------
 
 
