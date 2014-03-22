@@ -1,25 +1,27 @@
 /* IPK 2013/2014
  * Projekt c.2 - Prenos souboru s omezenim rychlosti
+ *               Bandwidth-limited file transmission
  * Autor: Jan Krocil
  *        xkroci02@stud.fit.vutbr.cz
  * Datum: 17.3.2014
  *
  * ----------------------------------
  * Protocol (text,TCP):
- * client->server:
- *   FILENAME: filename.txt              \n
- * server->client:
- *   STATUS: OK, NOT_FOUND, BUSY, ERROR  \n
- *   FILESIZE: file size [bytes])        \n
- *   CONTENT:                            \n
+ * client --> server:
+ *   FILENAME: filename.txt           \n
+ * client <-- server:
+ *   STATUS: OK|NOT_FOUND|BUSY|ERROR  \n
+ *   (if STATUS is OK)
+ *   FILESIZE: file size [bytes]      \n
+ *   CONTENT:                         \n
  *   data in binary
  * ----------------------------------
  */
 
 #include <arpa/inet.h>
 #include <ctype.h>
-#include <netdb.h>
 #include <inttypes.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -27,6 +29,8 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#define MIN(x, y) ( ( (x) < (y) ) ? (x) : (y) )
 
 #define STR_BUFF_SIZE 4096
 #define DATA_BUFF_SIZE 65536
@@ -188,10 +192,15 @@ int exchange_info(char *filename, int64_t *filesize, int sock) {
 int download_file(int in_sock, FILE *out_file, int64_t filesize) {
   char data_buff[DATA_BUFF_SIZE] = "";
   int64_t bytes_read = 0, bytes_read_all = 0, bytes_written = 0;
-  while ((bytes_read = read(in_sock, data_buff, DATA_BUFF_SIZE)) > 0) {
-    bytes_read_all += bytes_read;
-    if ((bytes_written = fwrite(data_buff, 1, bytes_read, out_file)) <= 0)
-      break;
+  int64_t bytes_to_read = MIN(filesize, DATA_BUFF_SIZE);
+
+  while (bytes_to_read > 0) {
+      if ((bytes_read = read(in_sock, data_buff, bytes_to_read)) <= 0)
+        break;
+      bytes_read_all += bytes_read;
+      bytes_to_read = MIN((filesize - bytes_read_all), DATA_BUFF_SIZE);
+      if ((bytes_written = fwrite(data_buff, 1, bytes_read, out_file)) <= 0)
+        break;
   }
   if ((bytes_read < 0) || (bytes_written < 0) || (bytes_read_all != filesize))
     return 1;
