@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <semaphore.h>
 #include <signal.h>
 #include <string.h>
